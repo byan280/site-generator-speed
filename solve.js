@@ -38,11 +38,21 @@ function escText(s) {
   const at = s.search(/[&<>"']/);
   if (at === -1) return s;
   let out = s.slice(0, at);
+  let start = at;
   for (let i = at; i < s.length; i++) {
     const c = s[i];
-    out += c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : c === "'" ? '&#39;' : c;
+    let rep = null;
+    if (c === '&') rep = '&amp;';
+    else if (c === '<') rep = '&lt;';
+    else if (c === '>') rep = '&gt;';
+    else if (c === '"') rep = '&quot;';
+    else if (c === "'") rep = '&#39;';
+    if (rep !== null) {
+      out += s.slice(start, i) + rep;
+      start = i + 1;
+    }
   }
-  return out;
+  return out + s.slice(start);
 }
 
 function trimEnds(s) {
@@ -64,6 +74,13 @@ WS128[32] = 1;
 function slugOf(text, memo) {
   const hit = memo.get(text);
   if (hit !== undefined) return hit;
+  if (!/[^\x00-\x7F]/.test(text)) {
+    let out = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    if (out.length > 64) out = out.slice(0, 64).replace(/-+$/, '');
+    if (out === '') out = 'untitled';
+    memo.set(text, out);
+    return out;
+  }
   const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
@@ -113,6 +130,9 @@ function dirOfPath(path) {
 }
 
 function resolveRel(dir, rel) {
+  if (rel === '..') return dir === '' ? null : dirOfPath(dir);
+  if (rel === '.') return dir;
+  if (!rel.includes('/')) return dir === '' ? rel : dir + '/' + rel;
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -213,12 +233,14 @@ function parseFM(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  const bodyLines = lines.slice(close + 1);
+  return { data, body: bodyLines.join('\n'), bodyLines };
 }
 
 // ------------------------------------------------------------------ Markdown
 
 function findSeq(s, what, from) {
+  if (s.indexOf('\\', from) === -1) return s.indexOf(what, from);
   for (let j = from; j + what.length <= s.length; j++) {
     if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
       j++;
@@ -230,6 +252,11 @@ function findSeq(s, what, from) {
 }
 
 function findStar(s, from) {
+  if (s.indexOf('\\', from) === -1) {
+    let j = s.indexOf('*', from);
+    while (j !== -1 && s[j + 1] === '*') j = s.indexOf('*', j + 2);
+    return j;
+  }
   for (let j = from; j < s.length; j++) {
     const c = s[j];
     if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
@@ -246,13 +273,12 @@ function findStar(s, from) {
   return -1;
 }
 
+const SPECIAL_RX = /[\\`*\[]/g;
+
 function nextSpecial(s, from) {
-  let j = s.length;
-  for (const ch of SPECIALS) {
-    const k = s.indexOf(ch, from);
-    if (k !== -1 && k < j) j = k;
-  }
-  return j;
+  SPECIAL_RX.lastIndex = from;
+  const m = SPECIAL_RX.exec(s);
+  return m === null ? s.length : m.index;
 }
 
 function inlineMd(s, linkFn) {
@@ -344,20 +370,12 @@ function endsPara(line) {
   return false;
 }
 
-function renderBody(src, linkFn, memo) {
-  const lines = src.split('\n');
+const WORD_RX = /\S+/g;
+
+function renderBody(src, lines, linkFn, memo) {
   let words = 0;
-  for (const ln of lines) {
-    let inWord = false;
-    for (let k = 0; k < ln.length; k++) {
-      const code = ln.charCodeAt(k);
-      if (code < 128 ? WS128[code] === 1 : /\s/.test(ln[k])) inWord = false;
-      else if (!inWord) {
-        inWord = true;
-        words++;
-      }
-    }
-  }
+  WORD_RX.lastIndex = 0;
+  while (WORD_RX.exec(src) !== null) words++;
   const parts = [];
   const toc = [];
   const ids = new Set();
@@ -379,9 +397,9 @@ function renderBody(src, linkFn, memo) {
         i++;
         while (i < lines.length && !FENCE_SHUT_RX.test(lines[i])) body.push(lines[i++]);
         i++;
-        let code = '';
-        for (const bl of body) code += escText(bl) + '\n';
-        parts.push('<pre><code' + (lang === '' ? '' : ' class="language-' + escText(lang) + '"') + '>' + code + '</code></pre>\n');
+        const codeParts = [];
+        for (const bl of body) codeParts.push(escText(bl), '\n');
+        parts.push('<pre><code' + (lang === '' ? '' : ' class="language-' + escText(lang) + '"') + '>' + codeParts.join('') + '</code></pre>\n');
         continue;
       }
     } else if (c0 === '#') {
@@ -638,6 +656,7 @@ export function run(input) {
     }
     s.data = fm.data;
     s.body = fm.body;
+    s.bodyLines = fm.bodyLines;
     s.isPost = s.path.startsWith('posts/');
     const ownDir = s.path.startsWith('tags/') ? 'tags' : s.path.startsWith('page/') ? 'page' : '';
     if (ownDir !== '') {
@@ -689,7 +708,7 @@ export function run(input) {
       brokenSet.add('broken-link ' + s.path + ' -> ' + target);
       return target;
     };
-    const rendered = renderBody(s.body, linkFn, memo);
+    const rendered = renderBody(s.body, s.bodyLines, linkFn, memo);
     s.html = rendered.html;
     s.toc = rendered.toc;
     s.excerpt = rendered.excerpt;
